@@ -18,10 +18,12 @@ from __future__ import print_function
 
 import collections
 from functools import partial
+import textwrap
 import unittest
 import warnings
 import weakref
 
+from absl import logging
 from absl.testing import absltest
 import numpy as onp
 import six
@@ -1249,9 +1251,54 @@ class APITest(jtu.JaxTestCase):
     python_should_be_executing = False
     api.pmap(f, 'i')(x)
 
-  def test_repr(self):
+  def test_device_array_repr(self):
     rep = repr(np.ones(()) + 1.)
     self.assertStartsWith(rep, 'DeviceArray')
+
+  def test_lazy_reshape_multiply(self):
+    a = np.array([1, 2, 3])
+
+    with self.assertLogs(level=logging.DEBUG) as l:
+      x = a[:, None] * a[None, :]
+
+    expected = textwrap.dedent(
+    '''
+    {
+      parameter.1 = s32[3]{0} parameter(0)
+      reshape.2 = s32[3,1]{1,0} reshape(parameter.1)
+      reshape.5 = s32[3]{0} reshape(reshape.2)
+      broadcast.6 = s32[3,3]{1,0} broadcast(reshape.5), dimensions={0}
+      parameter.3 = s32[3]{0} parameter(1)
+      reshape.4 = s32[1,3]{1,0} reshape(parameter.3)
+      reshape.7 = s32[3]{0} reshape(reshape.4)
+      broadcast.8 = s32[3,3]{1,0} broadcast(reshape.7), dimensions={1}
+      ROOT multiply.9 = s32[3,3]{1,0} multiply(broadcast.6, broadcast.8)
+    }
+    ''').strip()
+    self.assertIn(expected, l.output[-1])
+    expected = onp.outer([1, 2, 3], [1, 2, 3])
+    self.assertAllClose(x, expected, check_dtypes=False)
+
+  def test_lazy_iota_broadcast_add(self):
+    with self.assertLogs(level=logging.DEBUG) as l:
+      a = np.arange(3)
+      y = np.broadcast_to(a, (5, 3))
+      z = y + 5
+
+    expected = textwrap.dedent(
+    '''
+    {
+      iota.1 = s32[3]{0} iota(), iota_dimension=0
+      broadcast.2 = s32[5,3]{1,0} broadcast(iota.1), dimensions={1}
+      parameter.3 = s32[] parameter(0)
+      broadcast.4 = s32[5,3]{1,0} broadcast(parameter.3), dimensions={}
+      ROOT add.5 = s32[5,3]{1,0} add(broadcast.2, broadcast.4)
+    }
+    ''').strip()
+    self.assertIn(expected, l.output[-1])
+    expected = onp.broadcast_to(onp.arange(3), (5, 3)) + 5
+    self.assertAllClose(z, expected, check_dtypes=False)
+
 
 if __name__ == '__main__':
   absltest.main()

@@ -412,9 +412,9 @@ def xla_pmap_impl(fun, *args, **params):
   backend = params.pop('backend', None)
   assert not params
 
-  abstract_args = map(xla.abstractify, args)
+  avals = [xla.abstractify(xla.force(x)) for x in args]
   compiled_fun = parallel_callable(fun, backend, axis_name, axis_size, devices,
-                                   *abstract_args)
+                                   *avals)
   return compiled_fun(*args)
 
 @lu.cache
@@ -442,8 +442,8 @@ def parallel_callable(fun, backend, axis_name, axis_size, devices, *avals):
     with extend_dynamic_axis_env(axis_name, dummy.trace, global_axis_size):
       return fun.call_wrapped(*args)
 
-  avals = tuple(map(partial(shard_aval, axis_size), avals))
-  pvals = [PartialVal((aval, core.unit)) for aval in avals]
+  sharded_avals = [shard_aval(axis_size, aval) for aval in avals]
+  pvals = [PartialVal((aval, core.unit)) for aval in sharded_avals]
   pval = PartialVal([core.abstract_unit, core.unit])  # dummy value for axis env
   with core.new_master(JaxprTrace, True) as master:
     jaxpr, (out_pvals, consts, env) = \
@@ -466,12 +466,15 @@ def parallel_callable(fun, backend, axis_name, axis_size, devices, *avals):
   num_local_replicas = axis_size * jaxpr_replicas
   nrep = global_axis_size * jaxpr_replicas
   axis_env = xla.AxisEnv(nrep, [axis_name], [global_axis_size], devices)
+  logging.vlog(
+    1, "parallel_callable: axis_size=%d global_axis_size=%d jaxpr_replicas=%d"
+    % (axis_size, global_axis_size, jaxpr_replicas))
 
   tuple_args = len(avals) > 100  # pass long arg lists as tuple for TPU
 
   c = xb.make_computation_builder("pmap_{}".format(fun.__name__))
   xla_consts = _map(c.Constant, consts)
-  xla_args = xla._xla_callable_args(c, avals, tuple_args)
+  xla_args = _pmap_callable_args(c, sharded_avals, tuple_args)
   out_nodes = xla.jaxpr_subcomp(c, jaxpr, backend, axis_env, xla_consts, (), *xla_args)
   built = c.Build(c.Tuple(*out_nodes))
 
@@ -506,6 +509,11 @@ def parallel_callable(fun, backend, axis_name, axis_size, devices, *avals):
                         axis_size, tuple_args)
   handle_outs = _pvals_to_results_handler(axis_size, nrep, out_pvals)
   return partial(execute_replicated, compiled, backend, nrep, handle_args, handle_outs)
+
+def _pmap_callable_args(c, avals, tuple_args):
+  arg_specs = [xla.ArgSpec(aval, xla.LazyArrayVar(), aval_to_xla_shape(aval))
+               for aval in avals]
+  return xla._xla_callable_args(c, arg_specs, tuple_args)
 
 def _pvals_to_results_handler(size, nrep, out_pvals):
   nouts = len(out_pvals)
